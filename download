@@ -1,0 +1,16 @@
+# Copy this file to .env and fill in your values
+# NEVER commit .env to Git
+
+# --- Supabase ---
+# Find these in: Supabase → Your Project → Settings → API
+SUPABASE_URL=https://your-project-id.supabase.co
+SUPABASE_SERVICE_KEY=your-service-role-key-here
+
+# --- Shopify ---
+# Find these in: Shopify Admin → Apps → your app → API credentials
+SHOPIFY_STORE_DOMAIN=auracarat.myshopify.com
+SHOPIFY_ACCESS_TOKEN=your-shopify-admin-api-token
+SHOPIFY_WEBHOOK_SECRET=your-webhook-secret
+
+# --- App ---
+PORT=3000
