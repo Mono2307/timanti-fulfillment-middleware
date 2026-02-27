@@ -1,44 +1,19 @@
-// ============================================================
-// SIAS API - Main Server
-// Serialized Inventory Allocation & Fulfilment System
-// Auracarat
-// ============================================================
-
-require('dotenv').config()
-const express = require('express')
-const app = express()
-
-// --- Parse incoming JSON (needed for webhooks & API calls) ---
-// Note: raw body is kept for Shopify webhook signature verification
-app.use((req, res, next) => {
-  if (req.originalUrl === '/webhooks/order-paid') {
-    // Keep raw body for Shopify HMAC verification
-    let data = ''
-    req.setEncoding('utf8')
-    req.on('data', chunk => { data += chunk })
-    req.on('end', () => {
-      req.rawBody = data
-      req.body = JSON.parse(data)
-      next()
-    })
-  } else {
-    express.json()(req, res, next)
+{
+  "name": "sias-api",
+  "version": "1.0.0",
+  "description": "Serialized Inventory Allocation and Fulfilment System - Auracarat",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "@supabase/supabase-js": "^2.39.0",
+    "dotenv": "^16.3.1",
+    "crypto": "^1.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
   }
-})
-
-// --- Health check (lets Fly.io know the server is alive) ---
-app.get('/', (req, res) => {
-  res.json({ status: 'SIAS API is running ✅', version: '1.0.0' })
-})
-
-// --- Routes ---
-app.use('/inventory', require('./routes/inventory'))
-app.use('/orders',    require('./routes/orders'))
-app.use('/webhooks',  require('./routes/webhooks'))
-app.use('/admin',     require('./routes/admin'))
-
-// --- Start server ---
-const PORT = process.env.PORT || 3000
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`SIAS API running on port ${PORT}`)
-})
+}
