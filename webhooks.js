@@ -1,181 +1,186 @@
 // ============================================================
-// ADMIN ROUTES
+// WEBHOOK ROUTES
 //
-// GET /admin/audit-log         → Full history of all events
-// GET /admin/pending-orders    → Orders tagged 'inventory_pending'
-// GET /admin/locations         → List all locations
-// POST /admin/return           → Mark a piece as returned
-// POST /admin/repair           → Mark a piece as in repair
+// POST /webhooks/order-paid
+// Shopify calls this automatically every time a customer pays
+// We then try to allocate physical pieces to that order
 // ============================================================
 
 const express = require('express')
 const router = express.Router()
-const supabase = require('../supabase')
+const crypto = require('crypto')
+const supabase = require('./supabase')
 
 // ----------------------------------------------------------
-// GET /admin/audit-log
-// Full event history — shown in Retool audit log screen
-// Optional query params: ?jewelcode=AC-001 or ?limit=50
+// POST /webhooks/order-paid
+// Shopify fires this when an order is paid
 // ----------------------------------------------------------
-router.get('/audit-log', async (req, res) => {
-  const { jewelcode, limit = 100 } = req.query
+router.post('/order-paid', async (req, res) => {
 
-  let query = supabase
-    .from('inventory_events')
-    .select('*')
-    .order('timestamp', { ascending: false })
-    .limit(parseInt(limit))
+  // --- Step 1: Verify this actually came from Shopify ---
+  const hmacHeader = req.headers['x-shopify-hmac-sha256']
+  const secret = process.env.SHOPIFY_WEBHOOK_SECRET
 
-  if (jewelcode) {
-    query = query.eq('jewelcode', jewelcode)
+  if (!hmacHeader || !secret) {
+    console.error('Missing HMAC header or webhook secret')
+    return res.status(401).json({ error: 'Unauthorized' })
   }
 
-  const { data: events, error } = await query
+  const generatedHmac = crypto
+    .createHmac('sha256', secret)
+    .update(req.rawBody, 'utf8')
+    .digest('base64')
 
-  if (error) return res.status(500).json({ success: false, error: error.message })
+  if (generatedHmac !== hmacHeader) {
+    console.error('HMAC verification failed — request not from Shopify')
+    return res.status(401).json({ error: 'HMAC verification failed' })
+  }
 
-  return res.json({ success: true, count: events.length, events })
+  // --- Step 2: Extract order details ---
+  const order = req.body
+  const shopifyOrderId = order.id?.toString()
+  const lineItems = order.line_items || []
+
+  if (!shopifyOrderId) {
+    return res.status(400).json({ error: 'Invalid order payload' })
+  }
+
+  console.log(`New paid order received: ${shopifyOrderId}`)
+
+  // --- Step 3: Respond to Shopify immediately ---
+  res.status(200).json({ received: true })
+
+  // --- Step 4: Process allocation in background ---
+  try {
+    const itemsToAllocate = lineItems.map(item => ({
+      variant_id: item.variant_id?.toString(),
+      quantity: item.quantity || 1,
+      sku: item.sku || '',
+      title: item.title
+    }))
+
+    const allocationResult = await allocateOrder(shopifyOrderId, itemsToAllocate)
+
+    console.log(`Allocation result for order ${shopifyOrderId}:`, allocationResult)
+
+    await supabase.from('inventory_events').insert({
+      jewelcode: 'WEBHOOK',
+      action: 'webhook_received',
+      source: 'online',
+      metadata: {
+        order_id: shopifyOrderId,
+        line_items_count: lineItems.length,
+        allocation_success: allocationResult.success
+      },
+      timestamp: new Date().toISOString()
+    })
+
+  } catch (err) {
+    console.error(`Error processing order ${shopifyOrderId}:`, err.message)
+  }
 })
 
 // ----------------------------------------------------------
-// GET /admin/pending-orders
-// Orders that couldn't be allocated — need manual attention
-// These are pieces where status never moved past order creation
+// INTERNAL: Allocation logic
 // ----------------------------------------------------------
-router.get('/pending-orders', async (req, res) => {
-  // Find events where allocation failed
-  const { data: failEvents, error } = await supabase
-    .from('inventory_events')
-    .select('*')
-    .eq('action', 'fail')
-    .order('timestamp', { ascending: false })
-    .limit(50)
+async function allocateOrder(order_id, line_items) {
+  const results = []
+  const failures = []
 
-  if (error) return res.status(500).json({ success: false, error: error.message })
+  for (const item of line_items) {
+    const { variant_id, sku, quantity = 1 } = item
 
-  return res.json({
-    success: true,
-    count: failEvents.length,
-    pending: failEvents
-  })
-})
+    if (!sku || sku === '') {
+      console.log(`Skipping item with no SKU, variant_id: ${variant_id}`)
+      continue
+    }
 
-// ----------------------------------------------------------
-// GET /admin/locations
-// List all locations with inventory counts
-// ----------------------------------------------------------
-router.get('/locations', async (req, res) => {
-  const { data: locations, error } = await supabase
-    .from('locations')
-    .select('*')
-    .order('location_name')
+    const { data: locations } = await supabase
+      .from('locations')
+      .select('location_id')
+      .eq('is_active', true)
+      .eq('fulfils_online', true)
+      .order('location_id')
 
-  if (error) return res.status(500).json({ success: false, error: error.message })
+    if (!locations || locations.length === 0) {
+      failures.push({ sku, reason: 'no_fulfilling_locations' })
+      continue
+    }
 
-  // Get counts per location
-  const locationsWithCounts = await Promise.all(
-    locations.map(async (loc) => {
-      const { count: total } = await supabase
+    const locationIds = locations.map(l => l.location_id)
+
+    const { data: availablePieces } = await supabase
+      .from('inventory_pieces')
+      .select('jewelcode, location_id')
+      .eq('variant_sku', sku)
+      .eq('status', 'available')
+      .in('location_id', locationIds)
+      .limit(quantity)
+
+    if (!availablePieces || availablePieces.length < quantity) {
+      failures.push({
+        sku,
+        needed: quantity,
+        found: availablePieces?.length || 0,
+        reason: 'insufficient_inventory'
+      })
+      await tagShopifyOrder(order_id, 'inventory_pending')
+      continue
+    }
+
+    for (const piece of availablePieces) {
+      const { data: updated } = await supabase
         .from('inventory_pieces')
-        .select('*', { count: 'exact', head: true })
-        .eq('location_id', loc.location_id)
-
-      const { count: available } = await supabase
-        .from('inventory_pieces')
-        .select('*', { count: 'exact', head: true })
-        .eq('location_id', loc.location_id)
+        .update({
+          status: 'allocated',
+          order_id,
+          updated_at: new Date().toISOString()
+        })
+        .eq('jewelcode', piece.jewelcode)
         .eq('status', 'available')
+        .select()
+        .single()
 
-      return { ...loc, total_pieces: total, available_pieces: available }
-    })
-  )
+      if (!updated) {
+        failures.push({ sku, jewelcode: piece.jewelcode, reason: 'race_condition' })
+        continue
+      }
 
-  return res.json({ success: true, locations: locationsWithCounts })
-})
+      await supabase.from('inventory_events').insert({
+        jewelcode: piece.jewelcode,
+        action: 'allocate',
+        source: 'online',
+        metadata: { order_id, sku },
+        timestamp: new Date().toISOString()
+      })
 
-// ----------------------------------------------------------
-// POST /admin/return
-// Mark a piece as returned (goes back to available)
-//
-// Body: { jewelcode: "AC-001234", reason: "customer changed mind" }
-// ----------------------------------------------------------
-router.post('/return', async (req, res) => {
-  const { jewelcode, reason } = req.body
-
-  if (!jewelcode) {
-    return res.status(400).json({ success: false, error: 'jewelcode is required' })
+      results.push({ jewelcode: piece.jewelcode, sku, order_id })
+    }
   }
 
-  const { data: piece } = await supabase
-    .from('inventory_pieces')
-    .select('*')
-    .eq('jewelcode', jewelcode)
-    .single()
-
-  if (!piece) {
-    return res.status(404).json({ success: false, error: 'Piece not found' })
+  return {
+    success: failures.length === 0,
+    allocated: results,
+    failed: failures
   }
+}
 
-  const { error } = await supabase
-    .from('inventory_pieces')
-    .update({
-      status: 'available',
-      order_id: null,
-      updated_at: new Date().toISOString()
-    })
-    .eq('jewelcode', jewelcode)
-
-  if (error) return res.status(500).json({ success: false, error: error.message })
-
-  await supabase.from('inventory_events').insert({
-    jewelcode,
-    action: 'return',
-    source: 'admin',
-    metadata: { previous_status: piece.status, reason: reason || 'not provided' },
-    timestamp: new Date().toISOString()
-  })
-
-  return res.json({
-    success: true,
-    message: `Piece ${jewelcode} marked as returned and available again`
-  })
-})
-
-// ----------------------------------------------------------
-// POST /admin/repair
-// Mark a piece as in repair (takes it out of available pool)
-//
-// Body: { jewelcode: "AC-001234", reason: "clasp broken" }
-// ----------------------------------------------------------
-router.post('/repair', async (req, res) => {
-  const { jewelcode, reason } = req.body
-
-  if (!jewelcode) {
-    return res.status(400).json({ success: false, error: 'jewelcode is required' })
+async function tagShopifyOrder(shopifyOrderId, tag) {
+  try {
+    await fetch(
+      `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/orders/${shopifyOrderId}.json`,
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN
+        },
+        body: JSON.stringify({ order: { id: shopifyOrderId, tags: tag } })
+      }
+    )
+  } catch (err) {
+    console.error('Shopify tag error:', err.message)
   }
-
-  const { error } = await supabase
-    .from('inventory_pieces')
-    .update({
-      status: 'repair',
-      updated_at: new Date().toISOString()
-    })
-    .eq('jewelcode', jewelcode)
-
-  if (error) return res.status(500).json({ success: false, error: error.message })
-
-  await supabase.from('inventory_events').insert({
-    jewelcode,
-    action: 'repair',
-    source: 'admin',
-    metadata: { reason: reason || 'not provided' },
-    timestamp: new Date().toISOString()
-  })
-
-  return res.json({
-    success: true,
-    message: `Piece ${jewelcode} marked as in repair`
-  })
-})
+}
 
 module.exports = router
