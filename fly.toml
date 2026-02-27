@@ -1,16 +1,16 @@
-FROM node:20-alpine
+app = 'sias-api-auracarat'
+primary_region = 'bom'
 
-WORKDIR /app
+[build]
 
-# Install dependencies first (cached layer)
-COPY package*.json ./
-RUN npm install --production
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
 
-# Copy source code
-COPY . .
-
-# Expose port
-EXPOSE 3000
-
-# Start the server
-CMD ["node", "index.js"]
+[[vm]]
+  memory = '256mb'
+  cpu_kind = 'shared'
+  cpus = 1
