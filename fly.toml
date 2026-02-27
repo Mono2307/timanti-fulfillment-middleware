@@ -1,4 +1,4 @@
-app = 'app = 'timanti-middleware'
+app = 'timanti-middleware'
 primary_region = 'bom'
 
 [build]
