@@ -1,4 +1,4 @@
-app = 'sias-api-auracarat'
+app = 'app = 'timanti-middleware''
 primary_region = 'bom'
 
 [build]
